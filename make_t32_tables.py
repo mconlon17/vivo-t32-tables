@@ -21,6 +21,7 @@ __version__ = "0.0"
 import vivotools as vt
 import datetime
 import json
+import tempita
 
 # I wish rtf-ng was more organized and we didn't need all the imports below,
 # but it isn't and we do.
@@ -35,6 +36,179 @@ from rtfng.PropertySets import MarginsPropertySet, BorderPropertySet, \
     FramePropertySet, TabPropertySet, TextPropertySet, ParagraphPropertySet
 from rtfng.document.base import TAB
 
+def find_dept(deptid):
+    """
+    Given a UF deptid, find the URI of the org that has that deptid
+    """
+    query = tempita.Template("""
+    SELECT ?uri
+    WHERE {
+        ?uri ufVivo:deptID "{{deptid}}" .
+    }
+    """)
+    query = query.substitute(deptid=deptid)
+    result = vt.vivo_sparql_query(query)
+    try:
+        uri = result['results']['bindings'][0]['uri']['value']
+    except:
+        uri = None
+    return uri
+
+def find_person(ufid):
+    """
+    Given a UFID, find the URI of the person that has that ufidid
+    """
+    query = tempita.Template("""
+    SELECT ?uri
+    WHERE {
+        ?uri ufVivo:ufid "{{ufid}}" .
+    }
+    """)
+    query = query.substitute(ufid=ufid)
+    result = vt.vivo_sparql_query(query)
+    try:
+        uri = result['results']['bindings'][0]['uri']['value']
+    except:
+        uri = None
+    return uri
+
+def t32_dept_counts(uri):
+    """
+    Given a URI of a unit, count five things the NIH wants to know about
+    the unit for a T32 application
+    """
+    query = tempita.Template("""
+#
+# Count the faculty, graduate students and postdocs in a unit
+#
+    SELECT
+           (COUNT(DISTINCT ?fac) AS ?faculty_count)
+           (COUNT(DISTINCT ?pre) AS ?predoc_count)
+           (COUNT(DISTINCT ?pos) AS ?postdoc_count)
+           (COUNT(DISTINCT ?pre_sup) AS ?predoc_supported)
+           (COUNT(DISTINCT ?pos_sup) AS ?postdoc_supported)
+    WHERE {
+        {
+        ?fac ufVivo:homeDept <{{uri}}> .
+        ?fac a vivo:FacultyMember .
+        }
+        UNION {
+        ?pre ufVivo:homeDept <{{uri}}> .
+        ?pre a vivo:GraduateStudent .
+        }
+        UNION {
+        ?pos ufVivo:homeDept <{{uri}}> .
+        ?pos a vivo:Postdoc .
+        }
+        UNION {
+        ?pre_sup ufVivo:homeDept <{{uri}}> .
+        ?pre_sup a vivo:GraduateStudent .
+        ?pre_sup vivo:hasPrincipalInvestigatorRole ?role .
+        ?role vivo:roleIn ?grant .
+        ?grant a vivo:Grant .
+        }
+        UNION {
+        ?pos_sup ufVivo:homeDept <{{uri}}> .
+        ?pos_sup a vivo:Postdoc .
+        ?pos_sup vivo:hasPrincipalInvestigatorRole ?role .
+        ?role vivo:roleIn ?grant .
+        ?grant a vivo:Grant .
+        }
+    }
+    GROUP BY ?uri
+    """)
+    query = query.substitute(uri=uri)
+    result = vt.vivo_sparql_query(query)
+    t32 = {}
+    for vname in ['faculty_count', 'predoc_count', 'postdoc_count',
+                  'predoc_supported','postdoc_supported']:
+        try:
+            t32[vname] = \
+                result['results']['bindings'][0][vname]['value']
+        except:
+            pass
+    return t32
+
+def t32_dept(dept, faculty, predoc, postdoc):
+    """
+    Given a dept structure, augment with data from VIVO and calculated values
+    """
+    new_dept = {}
+    for row,d in dept.items():
+        deptid = d['DEPTID']
+        uri = find_dept(deptid)
+        d['label'] = vt.get_vivo_value(uri,"rdfs:label")
+        result = t32_dept_counts(uri)
+        print d['NAME'],uri,result
+        for key in result.keys():
+            d[key] = result[key]
+        fac_participating = 0
+        for fac in faculty.values():
+            if fac['DEPTID'] == deptid:
+                fac_participating = fac_participating + 1
+        d['faculty_participating'] = fac_participating
+        pre_participating = 0
+        pre_tge = 0
+        pre_urm = 0
+        pre_disabilities = 0
+        pre_disadvantaged = 0
+        for pre in predoc.values():
+            if pre['DEPTID'] == deptid:
+                pre_participating = pre_participating + 1
+                if pre['TGE'] == "1":
+                    pre_tge = pre_tge + 1
+                if pre['URM'] == "1":
+                    pre_urm = pre_urm + 1
+                if pre['DISABILITIES'] == "1":
+                    pre_disabilities = pre_disabilities + 1
+                if pre['DISADVANTAGED'] == "1":
+                    pre_disadvantaged = pre_disadvantaged + 1
+        d['pre_participating'] = pre_participating
+        d['pre_tge'] = pre_tge
+        d['pre_urm'] = pre_urm
+        d['pre_disabilities'] = pre_disabilities
+        d['pre_disadvantaged'] = pre_disadvantaged
+        pos_participating = 0
+        pos_tge = 0
+        pos_urm = 0
+        pos_disabilities = 0
+        pos_disadvantaged = 0
+        for pos in postdoc.values():
+            if pos['DEPTID'] == deptid:
+                pos_participating = pos_participating + 1
+                if pos['TGE'] == "1":
+                    pos_tge = pos_tge + 1
+                if pos['URM'] == "1":
+                    pos_urm = pos_urm + 1
+                if pos['DISABILITIES'] == "1":
+                    pos_disabilities = pos_disabilities + 1
+                if pos['DISADVANTAGED'] == "1":
+                    pos_disadvantaged = pos_disadvantaged + 1
+        d['pos_participating'] = pos_participating
+        d['pos_tge'] = pos_tge
+        d['pos_urm'] = pos_urm
+        d['pos_disabilities'] = pos_disabilities
+        d['pos_disadvantaged'] = pos_disadvantaged
+        new_dept[row] = d
+
+    return new_dept
+
+def t32_faculty(faculty):
+    """
+    Given faculty participating in a T32, augment with VIVO data for
+    attributes of interest to the NIH
+    """
+    new_faculty = {}
+    for row, f in faculty.items():
+        uri = find_person(f['UFID'])
+        person = vt.get_person(uri, get_positions=True, get_degrees=True)
+        f['rank'] = person['preferred_title']
+        f['degrees'] = person['degrees']
+        f['positions'] = person['positions']
+        new_faculty[row] = f
+
+    return new_faculty
+
 # Start here. Get proposal data.  Setup the document
 
 print "Start", str(datetime.datetime.now())
@@ -46,21 +220,26 @@ faculty = {}
 predoc = {}
 postdoc = {}
 for row in data.keys():
-    role = data[row]["ROLE"]
-    if role == "department":
+    type = data[row]["TYPE"]
+    if type == "department":
         dept[row] = data[row]
-    elif role == "faculty":
+    elif type == "faculty":
         faculty[row] = data[row]
-    elif role == "predoc":
+    elif type == "predoc":
         predoc[row] = data[row]
-    elif role == "postdoc":
+    elif type == "postdoc":
         postdoc[row] = data[row]
     else:
-        print "No such role:", role, "on row", row
-print "Departments\n",json.dumps(dept,indent=4)
-print "Faculty\n",json.dumps(faculty,indent=4)
-print "Predoc\n",json.dumps(predoc,indent=4)
-print "Postdoc",json.dumps(postdoc,indent=4)
+        print "No such type:", type, "on row", row
+print "Departments\n", json.dumps(dept, indent=4)
+print "Faculty\n", json.dumps(faculty, indent=4)
+print "Predoc\n", json.dumps(predoc, indent=4)
+print "Postdoc", json.dumps(postdoc, indent=4)
+
+dept = t32_dept(dept, faculty, predoc, postdoc)
+print "Department data\n", json.dumps(dept, indent=4)
+faculty = t32_faculty(faculty)
+print "Faculty data\n", json.dumps(faculty, indent=4)
 
 thin_edge = BorderPropertySet(width=11, style=BorderPropertySet.SINGLE)
 topBottom = FramePropertySet(top=thin_edge, bottom=thin_edge)
